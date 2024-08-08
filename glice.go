@@ -9,14 +9,14 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/fatih/color"
-	m "github.com/keighl/metabolize"
 	"github.com/olekukonko/tablewriter"
+	"golang.org/x/mod/module"
 
 	"github.com/ribice/glice/v2/mod"
 )
@@ -78,19 +78,28 @@ func (c *Client) ParseDependencies(includeIndirect, thanks bool) error {
 
 	ctx := context.Background()
 	gitCl := newGitClient(ctx, map[string]string{"github.com": githubAPIKey}, thanks)
+	sem := make(chan struct{}, 5)
+	var wg sync.WaitGroup
 	for _, r := range repos {
 		log.Printf("Fetching license for: %s", r.URL)
-		err = gitCl.GetLicense(ctx, r)
-		if err != nil {
-			log.Println(err)
-		}
+		wg.Add(1)
+		sem <- struct{}{} // 获取一个信号量
+		go func(r1 *Repository) {
+			defer wg.Done()
+			defer func() { <-sem }() // 释放一个信号量
+			err1 := gitCl.GetLicense(ctx, r1)
+			if err1 != nil {
+				log.Println(err1)
+			}
+		}(r)
 	}
+	wg.Wait()
 	c.dependencies = repos
 	return nil
 }
 
 var (
-	headerRow = []string{"Dependency", "RepoURL", "License"}
+	headerRow = []string{"Dependency", "RepoURL", "License", "Version"}
 )
 
 func (c *Client) Print(writeTo io.Writer) error {
@@ -103,7 +112,7 @@ func (c *Client) Print(writeTo io.Writer) error {
 		tw := tablewriter.NewWriter(writeTo)
 		tw.SetHeader(headerRow)
 		for _, d := range c.dependencies {
-			tw.Append([]string{d.Name, color.BlueString(d.URL), d.Shortname})
+			tw.Append([]string{d.Name, color.BlueString(d.URL), d.Shortname, d.Version})
 		}
 		tw.Render()
 	case "json":
@@ -154,30 +163,32 @@ func ListRepositories(path string, withIndirect bool) ([]*Repository, error) {
 	}
 
 	repos := make([]*Repository, len(modules))
-	for i, mods := range modules {
-		repos[i] = getRepository(mods)
+	for i, mod := range modules {
+		repos[i] = getRepository(mod)
 	}
 
 	return repos, nil
 
 }
 
-func getRepository(s string) *Repository {
+func getRepository(mod module.Version) *Repository {
+	return getOtherRepo(mod)
+	s := mod.Path
 	spl := strings.Split(s, "/")
 	switch spl[0] {
 	case "github.com", "gitlab.com", "bitbucket.org":
 		if len(spl) < 3 {
 			return &Repository{Name: s}
 		}
-		return &Repository{URL: "https://" + spl[0] + "/" + spl[1] + "/" + spl[2], Host: spl[0], Author: spl[1], Project: spl[2], Name: s}
+		return &Repository{URL: "https://" + spl[0] + "/" + spl[1] + "/" + spl[2], Host: spl[0], Author: spl[1], Project: spl[2], Name: s, Version: mod.Version}
 
 	case "gopkg.in":
 		if len(spl) < 3 {
 			return &Repository{Name: s}
 		}
-		return &Repository{URL: "https://github.com/" + spl[1] + "/" + strings.Split(spl[2], ".")[0], Host: "github.com", Author: spl[1], Project: strings.Split(spl[2], ".")[0], Name: s}
+		return &Repository{URL: "https://github.com/" + spl[1] + "/" + strings.Split(spl[2], ".")[0], Host: "github.com", Author: spl[1], Project: strings.Split(spl[2], ".")[0], Name: s, Version: mod.Version}
 	}
-	return getOtherRepo(s)
+	return getOtherRepo(mod)
 }
 
 type metaData struct {
@@ -189,43 +200,15 @@ var cache = map[string]*Repository{}
 
 // Resolve indirect repos as described here:
 // https://golang.org/cmd/go/#hdr-Remote_import_paths
-func getOtherRepo(name string) *Repository {
+func getOtherRepo(mod module.Version) *Repository {
+	name := mod.Path
 	if v, ok := cache[name]; ok {
 		return v
 	}
 
-	lcs := &Repository{Name: name}
-
-	resp, err := http.Get(fmt.Sprintf("https://%s", name))
-	if err != nil {
-		return lcs
-	}
-
-	defer resp.Body.Close()
-
-	data := new(metaData)
-	if err = m.Metabolize(resp.Body, data); err != nil {
-		return lcs
-	}
-
-	imports := strings.Split(data.Import, " ")
-	if len(imports) != 3 {
-		return lcs
-	}
-
-	url := imports[2]
-	urlParts := strings.Split(url, "/")
-	if len(urlParts) < 4 {
-		return lcs
-	}
-
-	lcs.URL = strings.TrimSuffix(url, ".git")
-	lcs.Host = urlParts[2]
-	lcs.Author = urlParts[3]
-
-	if len(urlParts) == 5 {
-		lcs.Project = strings.TrimSuffix(urlParts[4], ".git")
-	}
+	lcs := &Repository{Name: name, Version: mod.Version}
+	lcs.URL = fmt.Sprintf("https://pkg.go.dev/%s", name)
+	lcs.Host = "pkg.go.dev"
 
 	cache[name] = lcs
 	return lcs

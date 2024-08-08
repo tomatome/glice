@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 
 	"golang.org/x/mod/modfile"
+	"golang.org/x/mod/module"
 )
 
 const goMod = "go.mod"
@@ -16,7 +17,7 @@ func Exists(path string) bool {
 	return false
 }
 
-func Parse(path string, withIndirect bool) ([]string, error) {
+func Parse(path string, withIndirect bool) ([]module.Version, error) {
 	bts, err := os.ReadFile(filepath.Join(path, goMod))
 	if err != nil {
 		return nil, err
@@ -27,12 +28,12 @@ func Parse(path string, withIndirect bool) ([]string, error) {
 		return nil, err
 	}
 
-	var deps []string
+	var deps []module.Version
 	for _, f := range modFile.Require {
 		if f.Indirect && !withIndirect {
 			continue
 		}
-		deps = append(deps, f.Mod.Path)
+		deps = append(deps, f.Mod)
 	}
 
 	return deps, nil
